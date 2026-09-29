@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+
+# 로컬에서 생성·동기화되는 상태와 데이터베이스
+data/momentlab.db
+data/documents.csv
+data/public_sync_state.json
+data/source_docs/

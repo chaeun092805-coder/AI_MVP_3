@@ -13,7 +13,7 @@ MANIFEST = Path("data/drive_manifest.csv")
 
 def extract_text(path):
     path = Path(path)
-    if path.suffix.lower() in {".txt", ".md"}:
+    if path.suffix.lower() in {".txt", ".md", ".csv"}:
         return path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".docx":
         with zipfile.ZipFile(path) as archive:
@@ -55,6 +55,8 @@ def _status(name, text):
 
 
 def _doc_type(name):
+    if "문서관리대장" in name:
+        return "문서관리대장"
     if "성과" in name or "RPT" in name:
         return "성과보고서"
     if "기획" in name or "PLN" in name or "_PP_" in name:
@@ -74,8 +76,8 @@ def import_all(db_path="data/momentlab.db"):
     # 로컬 사본 전체를 진실 원본으로 삼아 문서 색인을 원자적으로 다시 만든다.
     con.execute("DELETE FROM document_search_index")
     con.execute("DELETE FROM documents")
-    for path in sorted(SOURCE_ROOT.glob("U-*/*")):
-        if path.suffix.lower() not in {".txt", ".md", ".docx"}:
+    for path in sorted(SOURCE_ROOT.glob("*/*")):
+        if path.suffix.lower() not in {".txt", ".md", ".csv", ".docx"}:
             continue
         text = extract_text(path)
         project_id = path.parent.name
@@ -100,6 +102,9 @@ def import_all(db_path="data/momentlab.db"):
         con.execute("INSERT INTO document_search_index VALUES(?,?,?)", (document_id, path.stem, text))
         count += 1
     con.commit()
+    # Reimports replace the local index; no result from the previous index may survive.
+    from services.retrieval import clear_search_cache
+    clear_search_cache()
     columns = [row[1] for row in con.execute("PRAGMA table_info(documents)")]
     with Path("data/documents.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)

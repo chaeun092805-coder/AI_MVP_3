@@ -8,6 +8,16 @@ from services.drive_write import create_google_doc
 
 PROJECT_PATTERN = re.compile(r"(?<![A-Z0-9])U-?\d{2}(?!\d)", re.I)
 ALLOWED_TYPES = {"new_fact", "changed_fact", "rationale", "conflict", "reusable_experience"}
+QUESTION_ENDINGS = ("?", "알려줘", "보여줘", "찾아줘", "누구야", "뭐야", "언제야", "얼마야")
+STATEMENT_MARKERS = (
+    "했어", "했어요", "한다", "하기로", "정해졌어", "결정됐어", "결정했어",
+    "변경됐어", "바뀌었어", "확정됐어", "확정했어", "담당자는", "장소는", "예산은",
+)
+STATEMENT_ENDING_PATTERN = re.compile(
+    r"(?:했어(?:요)?|됐어(?:요)?|바뀌었어(?:요)?|정했어(?:요)?|선정했어(?:요)?|"
+    r"결정했어(?:요)?|확정했어(?:요)?|맡았어(?:요)?|체결했어(?:요)?|"
+    r"하기로\s*(?:했어(?:요)?|했다|결정했다)|이다|입니다|이야|야|있어(?:요)?|없어(?:요)?)\.?$"
+)
 
 
 def _project_id(text, contexts):
@@ -22,6 +32,76 @@ def _ask_model(prompt, schema):
     state = ensure_started()
     if not state["running"] or not state["model_ready"]:
         return None
+
+
+def is_fact_statement(text):
+    value = (text or "").strip()
+    if not value or value.endswith("?"):
+        return False
+    if any(value.endswith(ending) for ending in QUESTION_ENDINGS):
+        return False
+    return any(marker in value for marker in STATEMENT_MARKERS) or bool(STATEMENT_ENDING_PATTERN.search(value))
+
+
+def assess_statement(text, contexts, project_id=""):
+    """Classify a definitive user statement before answer generation; never writes data."""
+    if not is_fact_statement(text):
+        return {"classification": "QUESTION", "candidate": None}
+    packed = "\n\n".join(
+        f"[{item['document_id']}] {item['title']}\n{item.get('context', '')}"
+        for item in contexts[:5]
+    ) or "(확인 가능한 기존 문서 없음)"
+    prompt = f"""사용자의 확정적 사실 진술과 기존 승인 문서를 비교하세요.
+분류는 반드시 다음 중 하나입니다.
+- ALREADY_KNOWN: 같은 사실이 기존 문서에 이미 있음
+- NEW_INFORMATION: 기존 문서에서 확인되지 않는 새로운 사실
+- UPDATE_CANDIDATE: 같은 항목의 기존 값과 다른 변경 사실
+
+질문이나 추측으로 바꾸지 말고 사용자가 말한 내용만 간결하게 정리하세요.
+UPDATE_CANDIDATE이면 existing_fact와 conflict_note에 기존 값과 새 값의 차이를 적으세요.
+문서에 없는 내용을 추론하지 마세요.
+
+사용자 진술: {text}
+프로젝트: {project_id or '미확정'}
+
+기존 승인 문서:
+{packed}"""
+    schema = {
+        "type": "object",
+        "properties": {
+            "classification": {"type": "string", "enum": ["ALREADY_KNOWN", "NEW_INFORMATION", "UPDATE_CANDIDATE"]},
+            "title": {"type": "string"}, "summary": {"type": "string"},
+            "existing_fact": {"type": "string"}, "reason": {"type": "string"},
+            "conflict_note": {"type": "string"},
+        },
+        "required": ["classification", "title", "summary", "existing_fact", "reason", "conflict_note"],
+    }
+    result = _ask_model(prompt, schema)
+    if not result:
+        # Safe fallback: a definitive statement remains unverified and is never answered by inference.
+        result = {
+            "classification": "NEW_INFORMATION",
+            "title": f"{project_id or '프로젝트'} 사용자 제공 정보",
+            "summary": text.strip(), "existing_fact": "",
+            "reason": "현재 연결된 승인 문서에서 동일 사실을 자동 확인하지 못했습니다.",
+            "conflict_note": "",
+        }
+    classification = result.get("classification")
+    if classification == "ALREADY_KNOWN":
+        return {"classification": classification, "candidate": None, "existing_fact": result.get("existing_fact", "")}
+    candidate_type = "changed_fact" if classification == "UPDATE_CANDIDATE" else "new_fact"
+    candidate = {
+        "project_id": project_id or _project_id(text, contexts),
+        "original_text": text,
+        "title": str(result.get("title") or f"{project_id or '프로젝트'} 사용자 제공 정보").strip(),
+        "summary": str(result.get("summary") or text).strip(),
+        "candidate_type": candidate_type,
+        "reason": str(result.get("reason", "")).strip(),
+        "conflict_note": str(result.get("conflict_note", "")).strip(),
+        "existing_fact": str(result.get("existing_fact", "")).strip(),
+        "classification": classification,
+    }
+    return {"classification": classification, "candidate": candidate, "existing_fact": candidate["existing_fact"]}
     payload = {
         "model": state["model"], "prompt": prompt, "stream": False, "format": schema,
         "keep_alive": "30m", "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 450},
@@ -92,10 +172,10 @@ def assess_candidate(text, contexts):
     }
 
 
-def save_candidate(con, project_id, original_text, summary, candidate_type="new_fact", conversation_ids=(), edited_text="", conflict_note="", title=""):
+def save_candidate(con, project_id, original_text, summary, candidate_type="new_fact", conversation_ids=(), edited_text="", conflict_note="", title="", source_document_id="", source_drive_file_id=""):
     complete = project_is_complete(con, project_id)
-    cur = con.execute("""INSERT INTO memory_candidates(project_id,source_conversation_ids,original_text,title,summary,candidate_type,status,user_edited_text,conflict_note,project_complete_at_capture)
-      VALUES(?,?,?,?,?,?,'pending_review',?,?,?)""", (project_id, json.dumps(list(conversation_ids)), original_text, title, summary, candidate_type, edited_text, conflict_note, complete))
+    cur = con.execute("""INSERT INTO memory_candidates(project_id,source_conversation_ids,original_text,title,summary,candidate_type,status,user_edited_text,conflict_note,project_complete_at_capture,source_document_id,source_drive_file_id)
+      VALUES(?,?,?,?,?,?,'pending_review',?,?,?,?,?)""", (project_id, json.dumps(list(conversation_ids)), original_text, title, summary, candidate_type, edited_text, conflict_note, complete, source_document_id, source_drive_file_id))
     con.commit()
     return cur.lastrowid
 

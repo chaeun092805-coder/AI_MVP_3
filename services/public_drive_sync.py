@@ -24,6 +24,9 @@ _ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 
 def _download_url(url):
+    sheets = re.search(r"docs\.google\.com/spreadsheets/d/([^/]+)", url)
+    if sheets:
+        return f"https://docs.google.com/spreadsheets/d/{sheets.group(1)}/export?format=csv"
     docs = re.search(r"docs\.google\.com/document/d/([^/]+)", url)
     if docs:
         return f"https://docs.google.com/document/d/{docs.group(1)}/export?format=txt"
@@ -47,6 +50,8 @@ def _target(file_name):
     if existing:
         return existing
     project = re.match(r"(U-\d{2})", file_name)
+    if "문서관리대장" in file_name:
+        return SOURCE_ROOT / "_registry" / file_name
     if not project:
         raise ValueError(f"프로젝트 ID를 알 수 없는 파일명: {file_name}")
     return SOURCE_ROOT / project.group(1) / file_name

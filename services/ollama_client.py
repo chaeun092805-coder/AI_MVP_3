@@ -6,6 +6,11 @@ import time
 import urllib.error
 import urllib.request
 
+from config import (
+    QWEN_CONTEXT_CHARS, QWEN_CONTEXT_TOP_K, QWEN_KEEP_ALIVE,
+    QWEN_MAX_TOKENS, QWEN_TIMEOUT,
+)
+
 
 BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:3b"
@@ -80,7 +85,7 @@ def predict_search_terms(question, existing=()):
         "prompt": prompt,
         "stream": False,
         "format": schema,
-        "keep_alive": "30m",
+        "keep_alive": QWEN_KEEP_ALIVE,
         "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 100},
     }
     request = urllib.request.Request(
@@ -100,27 +105,53 @@ def predict_search_terms(question, existing=()):
         return list(dict.fromkeys([question, *existing]))
 
 
-def generate(question, evidence):
+def _fallback(evidence):
+    snippets = []
+    citations = []
+    for item in evidence[:3]:
+        text = " ".join((item.get("context") or item.get("excerpt") or "").split())[:420]
+        if text:
+            snippets.append(f"**{item['title']}**\n{text}")
+            citations.append(item["document_id"])
+    body = "\n\n".join(snippets) or "표시할 수 있는 관련 근거가 없습니다."
+    return {
+        "answer": "### 관련 근거\n\n" + body,
+        "citations": citations,
+        "caveats": ["AI 요약 답변을 생성하지 못해 관련 문서의 핵심 근거만 표시합니다."],
+    }
+
+
+def generate(question, evidence, conversation_context=""):
     if not evidence:
         return {"answer": "연결된 문서에서 질문과 관련된 내용을 찾지 못했습니다.", "citations": [], "caveats": []}
     state = ensure_started()
     if not state["running"] or not state["model_ready"]:
-        top = evidence[0]
-        return {
-            "answer": top["context"],
-            "citations": [top["document_id"]],
-            "caveats": ["로컬 모델을 사용할 수 없어 가장 관련도 높은 원문을 표시했습니다."],
-        }
+        return _fallback(evidence)
 
     packed = "\n\n".join(
-        f"[{item['document_id']}] 문서={item['title']} / 상태={item['status']}\n{item['context']}"
-        for item in evidence
+        f"[{item['document_id']}] 문서={item['title']} / 상태={item['status']}\n{item['context'][:QWEN_CONTEXT_CHARS]}"
+        for item in evidence[:QWEN_CONTEXT_TOP_K]
     )
-    prompt = f"""당신은 조직 문서 질의응답 도우미입니다. 한국어로 질문에 바로 답하세요.
-제공된 근거만 사용하고, 근거가 부족한 내용은 부족하다고 밝히세요.
-질문이 과거의 반려·변경·실패를 묻는다면 rejected 문서를 과거 사실로 사용할 수 있지만 현재 규칙처럼 표현하지 마세요.
-결론을 먼저 말하고, 필요한 경우 이유·실제 조치·결과를 구분해 설명하세요.
-citations에는 답변 작성에 실제로 사용한 document_id만 넣으세요. 관련성이 약한 문서는 인용하지 마세요.
+    prompt = f"""너는 조직 내부 문서를 바탕으로 사용자의 질문에 답하는 AI다.
+
+[답변 원칙]
+1. 검색된 원문을 그대로 나열하거나 복사하지 않는다.
+2. 질문에 대한 핵심 답변을 첫 1~2문장에 제시한다.
+3. 문서에서 확인된 사실만 사용하고 긴 내용은 핵심만 요약한다.
+4. 사용자가 행동해야 하는 내용은 항목별로 정리한다.
+5. 숫자, 비용, 일정 등 중요한 정보는 구체적으로 유지한다.
+6. 문서에 없는 내용은 추측하지 않는다.
+7. 과거 사례를 현재 상황에 무조건 적용해야 한다고 표현하지 않는다.
+
+[답변 형식]
+필요한 섹션만 사용하고 전체 답변은 간결하게 작성한다.
+### 핵심 답변 (질문에 직접 답하는 2~3문장)
+### 과거 사례 (실제 관련 사례와 결과)
+### 확인할 사항 (현재 확인할 사항과 필요한 경우 비용, 일정, 위험 요소)
+citations에는 실제 사용한 document_id만 넣는다.
+
+최근 대화 맥락(참고만 하고 문서 근거보다 우선하지 않음):
+{conversation_context[:1200]}
 
 질문: {question}
 
@@ -139,8 +170,8 @@ citations에는 답변 작성에 실제로 사용한 document_id만 넣으세요
         "prompt": prompt,
         "stream": False,
         "format": schema,
-        "keep_alive": "30m",
-        "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 300},
+        "keep_alive": QWEN_KEEP_ALIVE,
+        "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": QWEN_MAX_TOKENS},
     }
     request = urllib.request.Request(
         BASE_URL + "/api/generate",
@@ -148,18 +179,15 @@ citations에는 답변 작성에 실제로 사용한 document_id만 넣으세요
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=QWEN_TIMEOUT) as response:
             result = json.loads(json.load(response).get("response", "{}"))
         allowed = {item["document_id"] for item in evidence}
         citations = [item for item in result.get("citations", []) if item in allowed]
         if not citations:
             citations = [evidence[0]["document_id"]]
-        answer = result.get("answer", "").strip() or evidence[0]["context"]
+        answer = result.get("answer", "").strip()
+        if not answer:
+            return _fallback(evidence)
         return {"answer": answer, "citations": citations, "caveats": []}
     except Exception:
-        top = evidence[0]
-        return {
-            "answer": top["context"],
-            "citations": [top["document_id"]],
-            "caveats": ["답변 생성이 지연되어 가장 관련도 높은 원문을 표시했습니다."],
-        }
+        return _fallback(evidence)

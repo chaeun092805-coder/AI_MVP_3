@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from db import init_db
 from services.memory_flow import (
-    assess_candidate, pending_candidates, project_is_complete, publish_candidate,
+    assess_candidate, assess_statement, discard_candidate, is_fact_statement, pending_candidates, project_is_complete, publish_candidate,
     save_candidate, update_candidate,
 )
 from services.retrieval import search_documents
@@ -51,6 +51,58 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertIsNone(assess_candidate("U-03의 새로운 현장 운영 방식이야.", self.context))
         count = self.con.execute("SELECT count(*) FROM memory_candidates").fetchone()[0]
         self.assertEqual(0, count)
+
+    def test_question_is_not_fact_statement(self):
+        self.assertFalse(is_fact_statement("U-06에서 MC를 초청했어?"))
+
+    def test_definitive_statement_is_detected(self):
+        self.assertTrue(is_fact_statement("U-06에서는 MC를 초청했어."))
+
+    @patch("services.memory_flow._ask_model", return_value=None)
+    def test_missing_fact_becomes_new_information_without_answer_inference(self, _):
+        result = assess_statement("U-06에서는 MC를 초청했어.", self.context, "U-06")
+        self.assertEqual("NEW_INFORMATION", result["classification"])
+        self.assertEqual("new_fact", result["candidate"]["candidate_type"])
+
+    def test_business_fact_types_use_same_statement_detection(self):
+        statements = (
+            "행사 일정은 11월 17일로 확정됐어.",
+            "행사 장소는 코엑스야.",
+            "담당자는 김민수야.",
+            "예산은 3천만원이야.",
+            "운영 인원은 20명이야.",
+            "공급 업체는 새봄기획으로 선정했어.",
+            "행사는 온오프라인 병행 방식이야.",
+            "최종 승인이 완료됐어.",
+            "우천으로 행사가 취소됐어.",
+            "김민수가 현장 총괄을 맡았어.",
+            "계약 조건은 선금 30%야.",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                self.assertTrue(is_fact_statement(statement))
+
+    @patch("services.memory_flow._ask_model")
+    def test_existing_statement_is_not_candidate(self, model):
+        model.return_value = {
+            "classification": "ALREADY_KNOWN", "title": "", "summary": "",
+            "existing_fact": "전문 MC 1명 초청", "reason": "기존 문서 확인", "conflict_note": "",
+        }
+        contexts = [{**self.context[0], "context": "U-06에서 전문 MC 1명을 초청한다."}]
+        result = assess_statement("U-06에서는 MC를 초청했어.", contexts, "U-06")
+        self.assertEqual("ALREADY_KNOWN", result["classification"])
+        self.assertIsNone(result["candidate"])
+
+    @patch("services.memory_flow._ask_model")
+    def test_changed_date_becomes_update_candidate(self, model):
+        model.return_value = {
+            "classification": "UPDATE_CANDIDATE", "title": "U-06 행사일 변경",
+            "summary": "행사일이 11월 17일로 변경됨", "existing_fact": "행사일 11월 10일",
+            "reason": "기존 일정과 다름", "conflict_note": "11월 10일에서 11월 17일로 변경",
+        }
+        result = assess_statement("행사일이 11월 17일로 바뀌었어.", self.context, "U-06")
+        self.assertEqual("UPDATE_CANDIDATE", result["classification"])
+        self.assertEqual("changed_fact", result["candidate"]["candidate_type"])
 
     def test_save_preserves_original_and_edited_text_as_pending(self):
         save_candidate(

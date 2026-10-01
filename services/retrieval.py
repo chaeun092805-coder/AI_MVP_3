@@ -2,9 +2,14 @@ import hashlib
 import html
 import os
 import re
+import time
+from collections import OrderedDict
+from copy import deepcopy
 from difflib import SequenceMatcher
 
 import numpy as np
+
+from config import SEARCH_CACHE_SIZE, SEARCH_CACHE_TTL, SEARCH_TOP_K
 
 
 WORD_PATTERN = re.compile(r"[가-힣A-Za-z0-9_-]{2,}")
@@ -16,6 +21,52 @@ STOPWORDS = {
 HISTORY_WORDS = ("반려", "거절", "과거", "이전", "당시", "변경", "실패", "회고", "왜")
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 _embedding_model = None
+_search_cache = OrderedDict()
+TITLE_REQUEST_WORDS = (
+    "보여줄래", "보여줘", "알려줘", "내용 알려줘", "정리해줘", "찾아줘", "검색해줘",
+)
+
+
+def _normalized_question(text):
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def normalize_title(text):
+    value = (text or "").lower()
+    for word in TITLE_REQUEST_WORDS:
+        value = value.replace(word, "")
+    value = re.sub(r"\.(docx?|pdf|txt|md|csv)\b", "", value, flags=re.I)
+    return re.sub(r"[\s_\-()\[\]{}·.,]+", "", value)
+
+
+def find_documents_by_title(con, question):
+    query = normalize_title(question)
+    if len(query) < 5:
+        return []
+    matches = []
+    for row in con.execute("SELECT * FROM documents"):
+        document = dict(row)
+        title = normalize_title(document["title"])
+        exact = bool(title and (title == query or title in query))
+        partial = bool(len(title) >= 8 and (query in title or SequenceMatcher(None, query, title).ratio() >= 0.84))
+        if exact or partial:
+            matches.append((2 if exact else 1, len(title), document))
+    matches.sort(key=lambda item: (-item[0], -item[1], item[2]["document_id"]))
+    return [item[2] for item in matches]
+
+
+def _index_version(con):
+    documents = con.execute(
+        "SELECT count(*), coalesce(max(created_at), '') FROM documents"
+    ).fetchone()
+    memories = con.execute(
+        "SELECT count(*), coalesce(max(created_at), '') FROM memory_records WHERE status='approved'"
+    ).fetchone()
+    return tuple(documents) + tuple(memories)
+
+
+def clear_search_cache():
+    _search_cache.clear()
 
 
 def _compact(text):
@@ -73,35 +124,44 @@ def _model():
 
 
 def _ensure_embedding_index(con, documents):
-    if os.getenv("MOMENTLAB_DISABLE_EMBEDDINGS") == "1":
-        return False
+    embeddings_disabled = os.getenv("MOMENTLAB_DISABLE_EMBEDDINGS") == "1"
     con.execute("""CREATE TABLE IF NOT EXISTS document_chunks(
       chunk_id TEXT PRIMARY KEY, document_id TEXT NOT NULL, content_hash TEXT NOT NULL,
       text TEXT NOT NULL, embedding BLOB NOT NULL, dimensions INTEGER NOT NULL
     )""")
+    model = None
+    if not embeddings_disabled:
+        try:
+            model = _model()
+        except Exception as exc:
+            print(f"[SEARCH] embedding model unavailable; indexing text chunks only: {exc}")
     try:
-        model = _model()
         for document in documents:
             digest = hashlib.sha256(document["content"].encode()).hexdigest()
             current = con.execute(
-                "SELECT content_hash FROM document_chunks WHERE document_id=? LIMIT 1",
+                "SELECT content_hash,dimensions FROM document_chunks WHERE document_id=? LIMIT 1",
                 (document["document_id"],),
             ).fetchone()
-            if current and current[0] == digest:
+            if current and current[0] == digest and (not model or current[1] > 0):
                 continue
             passages = _passages(document["content"])
-            vectors = list(model.embed(passages))
+            vectors = list(model.embed(passages)) if model else [None] * len(passages)
             con.execute("DELETE FROM document_chunks WHERE document_id=?", (document["document_id"],))
             for index, (passage, vector) in enumerate(zip(passages, vectors)):
-                array = np.asarray(vector, dtype=np.float32)
+                if vector is None:
+                    blob, dimensions = b"", 0
+                else:
+                    array = np.asarray(vector, dtype=np.float32)
+                    blob, dimensions = array.tobytes(), len(array)
                 con.execute(
                     "INSERT INTO document_chunks VALUES(?,?,?,?,?,?)",
                     (f"{document['document_id']}::{index}", document["document_id"], digest,
-                     passage, array.tobytes(), len(array)),
+                     passage, blob, dimensions),
                 )
         con.commit()
-        return True
-    except Exception:
+        return model is not None
+    except Exception as exc:
+        print(f"[SEARCH] embedding index unavailable: {exc}")
         return False
 
 
@@ -151,6 +211,8 @@ def _semantic_passages(con, question, sources):
         )
         scores = {}
         for row in rows:
+            if row["dimensions"] <= 0:
+                continue
             vector = np.frombuffer(row["embedding"], dtype=np.float32, count=row["dimensions"])
             score = float(np.dot(query, vector) / ((np.linalg.norm(query) * np.linalg.norm(vector)) or 1))
             if row["document_id"] not in scores or score > scores[row["document_id"]][0]:
@@ -160,14 +222,35 @@ def _semantic_passages(con, question, sources):
         return {}
 
 
-def search_documents(con, question, limit=3, terms=()):
+def search_documents(
+    con, question, limit=None, terms=(), return_metadata=False,
+    allowed_document_ids=None, allowed_project_ids=None, force_document_scope=False,
+):
     """Hybrid RAG: combine typo-tolerant lexical relevance with local semantic vectors."""
+    limit = SEARCH_TOP_K if limit is None else limit
+    document_scope = tuple(sorted(allowed_document_ids or ()))
+    project_scope = tuple(sorted(allowed_project_ids or ()))
+    cache_key = (
+        _index_version(con), _normalized_question(question), tuple(terms), limit,
+        document_scope, project_scope, force_document_scope,
+    )
+    cached = _search_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] <= SEARCH_CACHE_TTL:
+        _search_cache.move_to_end(cache_key)
+        result = deepcopy(cached[1])
+        return (result, True) if return_metadata else result
+    if cached:
+        del _search_cache[cache_key]
     include_history = any(word in question for word in HISTORY_WORDS)
     requested_projects = {
         value.upper().replace("U", "U-").replace("--", "-")
         for value in PROJECT_PATTERN.findall(question)
     }
     documents = _eligible_documents(con, include_history) + _approved_memories(con)
+    if document_scope:
+        documents = [row for row in documents if row["document_id"] in document_scope]
+    if project_scope:
+        documents = [row for row in documents if row.get("project_id") in project_scope]
     if requested_projects:
         documents = [row for row in documents if row["project_id"].upper() in requested_projects]
 
@@ -196,10 +279,13 @@ def search_documents(con, question, limit=3, terms=()):
             hybrid += 0.08
         if row["document_type"] in {"성과보고서", "회고록"}:
             hybrid += 0.02
-        if hybrid >= 0.34 and (coverage >= 0.12 or semantic_score >= 0.35 or requested_projects):
+        forced = force_document_scope and row["document_id"] in document_scope
+        if forced or (hybrid >= 0.34 and (coverage >= 0.12 or semantic_score >= 0.35 or requested_projects)):
             passage = semantic_passage if semantic_score >= 0.48 else lexical_passage
+            if not passage:
+                passage = _passages(row["content"])[0]
             row.update(
-                score=round(hybrid, 4),
+                score=round(max(hybrid, 0.95) if forced else hybrid, 4),
                 lexical_score=round(normalized_lexical, 4),
                 semantic_score=round(semantic_score, 4),
                 context=passage[:1800],
@@ -209,9 +295,15 @@ def search_documents(con, question, limit=3, terms=()):
 
     ranked.sort(key=lambda item: (-item["score"], item["document_id"]))
     if not ranked:
-        return []
-    cutoff = max(0.34, ranked[0]["score"] * 0.72)
-    return [item for item in ranked if item["score"] >= cutoff][:limit]
+        result = []
+    else:
+        cutoff = max(0.34, ranked[0]["score"] * 0.72)
+        result = [item for item in ranked if item["score"] >= cutoff][:limit]
+    _search_cache[cache_key] = (time.monotonic(), deepcopy(result))
+    _search_cache.move_to_end(cache_key)
+    while len(_search_cache) > SEARCH_CACHE_SIZE:
+        _search_cache.popitem(last=False)
+    return (result, False) if return_metadata else result
 
 
 def highlight_html(text, terms):

@@ -37,6 +37,21 @@ def init_db(path=DB_PATH):
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, role TEXT NOT NULL,
       speaker TEXT NOT NULL CHECK(speaker IN ('user','assistant')), message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS chat_sessions(
+      session_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+      context_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS chat_exchanges(
+      exchange_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL, position INTEGER NOT NULL,
+      exchange_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, position),
+      FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS memory_candidates(
       candidate_id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, source_conversation_ids TEXT NOT NULL DEFAULT '',
       original_text TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL, candidate_type TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -73,10 +88,30 @@ def init_db(path=DB_PATH):
         "drive_status": "TEXT NOT NULL DEFAULT 'queued'",
         "drive_error": "TEXT NOT NULL DEFAULT ''",
         "project_complete_at_capture": "INTEGER NOT NULL DEFAULT 0",
+        "source_document_id": "TEXT NOT NULL DEFAULT ''",
+        "source_drive_file_id": "TEXT NOT NULL DEFAULT ''",
+        "draft_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "draft_id": "INTEGER",
     }
     for name, definition in candidate_migrations.items():
         if name not in candidate_columns:
             con.execute(f"ALTER TABLE memory_candidates ADD COLUMN {name} {definition}")
+    draft_columns = {row[1] for row in con.execute("PRAGMA table_info(closeout_drafts)")}
+    draft_migrations = {
+        "selected_candidate_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "draft_json": "TEXT NOT NULL DEFAULT '{}'",
+        "field_sources": "TEXT NOT NULL DEFAULT '{}'",
+        "candidate_placements": "TEXT NOT NULL DEFAULT '{}'",
+        "template_file_id": "TEXT NOT NULL DEFAULT ''",
+        "template_path": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in draft_migrations.items():
+        if name not in draft_columns:
+            con.execute(f"ALTER TABLE closeout_drafts ADD COLUMN {name} {definition}")
+    conversation_columns = {row[1] for row in con.execute("PRAGMA table_info(conversations)")}
+    if "session_id" not in conversation_columns:
+        con.execute("ALTER TABLE conversations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
     for pid in ("U-02", "U-03", "U-04", "U-05"):
         con.execute("INSERT OR IGNORE INTO projects VALUES(?,?, 'closed', ?, ?, ?)", (pid, pid + " 기존 프로젝트", "2026-01-01", "2026-12-31", "초기 Context"))
     con.commit()

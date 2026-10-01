@@ -6,13 +6,14 @@ from unittest.mock import patch
 from db import init_db
 from services.ollama_client import expand_query, generate, predict_search_terms
 from services.public_drive_sync import _download_url
-from services.retrieval import search_documents
+from services.retrieval import clear_search_cache, find_documents_by_title, search_documents
 
 
 class SearchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.con = init_db(Path(self.temp.name) / "test.db")
+        clear_search_cache()
 
     def tearDown(self):
         self.con.close()
@@ -74,17 +75,39 @@ class SearchTests(unittest.TestCase):
         )
 
     @patch("services.ollama_client.ensure_started", return_value={"running": False, "model_ready": False, "models": [], "model": "qwen2.5:3b"})
-    def test_model_failure_falls_back_to_best_source(self, _):
-        evidence = [{"document_id": "DOC", "context": "검증된 원문", "title": "문서", "status": "approved"}]
+    def test_model_failure_falls_back_to_short_evidence(self, _):
+        evidence = [{"document_id": "DOC", "context": "검증된 원문 " * 300, "title": "문서", "status": "approved"}]
         result = generate("질문", evidence)
-        self.assertEqual("검증된 원문", result["answer"])
+        self.assertIn("### 관련 근거", result["answer"])
+        self.assertLess(len(result["answer"]), 500)
+        self.assertIn("AI 요약 답변을 생성하지 못해", result["caveats"][0])
         self.assertEqual(["DOC"], result["citations"])
+
+    def test_identical_question_uses_search_cache(self):
+        self.add_doc("CACHE", "U-03", "우천 시 실내 전환 기준은 강수확률 80%이다")
+        first, first_hit = search_documents(self.con, "우천 실내 전환", return_metadata=True)
+        second, second_hit = search_documents(self.con, "  우천   실내 전환  ", return_metadata=True)
+        self.assertFalse(first_hit)
+        self.assertTrue(second_hit)
+        self.assertEqual(first[0]["document_id"], second[0]["document_id"])
 
     def test_public_drive_links_need_no_api(self):
         docs = _download_url("https://docs.google.com/document/d/DOC_ID/edit")
         drive = _download_url("https://drive.google.com/file/d/FILE_ID")
         self.assertEqual("https://docs.google.com/document/d/DOC_ID/export?format=txt", docs)
         self.assertIn("id=FILE_ID", drive)
+        sheet = _download_url("https://docs.google.com/spreadsheets/d/SHEET_ID/edit")
+        self.assertEqual("https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv", sheet)
+
+    def test_normalized_exact_title_match(self):
+        self.add_doc(
+            "U06", "U-06", "기획안 본문",
+            title="U-06_CREWAVE_하이브리드_크리에이터_어워즈_기획안.docx",
+        )
+        rows = find_documents_by_title(
+            self.con, "U-06 CREWAVE 하이브리드 크리에이터 어워즈 기획안 보여줄래?"
+        )
+        self.assertEqual("U06", rows[0]["document_id"])
 
 
 if __name__ == "__main__":
